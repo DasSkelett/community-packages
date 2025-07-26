@@ -8,6 +8,7 @@ local tmpdir = arg[1]
 
 local DHCP_IFACE = "client"
 local CONFIG_FILE = tmpdir .. "/noderoute.json"
+local clat_ifname = "clat0"
 
 util.loggername = "noderoute.lua"
 
@@ -53,9 +54,16 @@ local function get_wg_routes()
 	return result
 end
 
-local function set_wg_route(iface, conc)
+local function set_wg_route(iface, conc, clat)
+	-- TODO change IPv4 iface to nat46 iface when 464XLAT/CLAT is active
+	local iface4
+	if clat then
+		iface4 = clat_ifname
+	else
+		iface4 = iface
+	end
 	local res =
-		os.execute("ip -4 r replace default via " .. conc["address4"] .. " dev " .. iface .. " proto " .. RT_PROTO)
+		os.execute("ip -4 r replace default via " .. conc["address4"] .. " dev " .. iface4 .. " proto " .. RT_PROTO)
 	return res
 		+ os.execute("ip -6 r replace default via " .. conc["address6"] .. " dev " .. iface .. " proto " .. RT_PROTO)
 end
@@ -78,14 +86,14 @@ local function uci_set(config, section, option, value)
 	if not result then
 		util.log(
 			"uci.set("
-				.. tostring(config)
-				.. ", "
-				.. tostring(section)
-				.. ", "
-				.. tostring(option)
-				.. ", "
-				.. tostring(value)
-				.. ") failed"
+			.. tostring(config)
+			.. ", "
+			.. tostring(section)
+			.. ", "
+			.. tostring(option)
+			.. ", "
+			.. tostring(value)
+			.. ") failed"
 		)
 	end
 end
@@ -124,6 +132,12 @@ local function apply_network(conf, target_state)
 		util.log(DHCP_IFACE .. " ip6addr: " .. conf.address6 .. "/" .. prefix6_len)
 		uci_set("network", "client6", "proto", "static")
 		uci_set("network", "gluon_bat0", "gw_mode", "server")
+
+		if conf.xlat_range6 ~= nil then
+			-- 464XLAT/CLAT Setup
+			-- TODO start ebpf-clat here
+		end
+
 		if not util.check_output("ebtables-tiny -L PARKER_RADV"):find("DROP") then
 			os.execute("ebtables-tiny -A PARKER_RADV -j DROP")
 		end
@@ -147,8 +161,14 @@ local function apply_network(conf, target_state)
 		if util.read_file("/tmp/range6") ~= nil then
 			os.execute("rm /tmp/range6 -f")
 			os.execute("rm /tmp/addr6 -f")
+
+			if util.read_file("/tmp/range6") ~= nil then
+				os.execute("rm /tmp/xlat_range6 -f")
+			end
 			radvd_config_deleted = true
 		end
+
+		-- TODO unload kmod? remove clat config & iface
 
 		os.execute("ebtables-tiny -F PARKER_RADV")
 	end
@@ -188,6 +208,17 @@ local function apply_network(conf, target_state)
 
 			f = io.open("/tmp/addr6", "w")
 			f:write(conf.address6)
+			f:close()
+		end
+		os.execute("/etc/init.d/gluon-radvd restart")
+		changed = true
+	end
+
+	local xlat_range6 = util.read_file("/tmp/xlat_range6")
+	if (target_state and xlat_range6 ~= conf.xlat_range6) or radvd_config_deleted then
+		if conf.xlat_range6 ~= nil and target_state then
+			local f = io.open("/tmp/xlat_range6", "w")
+			f:write(conf.xlat_range6)
 			f:close()
 		end
 		os.execute("/etc/init.d/gluon-radvd restart")
@@ -238,6 +269,7 @@ local function update(report)
 			return
 		end
 		util.log(#active .. " active tunnels: Applying network state.")
+		xlat
 		apply_network(conf, true)
 	end
 
@@ -262,7 +294,8 @@ local function update(report)
 		local ip4route = util.check_output("ip -4 r show")
 		for line in string.gmatch(ip4route, "[^\n]+") do
 			if string.find(line, "default via") then
-				if string.find(line, "wg_") then
+				-- TODO nat46 device
+				if string.find(line, "wg_") or string.find(line, clat_ifname) then
 					for gw in string.gmatch(line, "via%s+(%S+)") do
 						os.execute("ip -4 r del default via " .. gw)
 					end
@@ -290,7 +323,13 @@ local function update(report)
 		local id = tonumber(act:match("[0-9]+"))
 		for _, conc in ipairs(conf["concentrators"]) do
 			if conc["id"] == id then
-				if set_wg_route(act, conc) == 0 then
+				local clat = false
+				if conf.xlat_range6 ~= nil then
+					clat = true
+				else
+					clat = false
+				end
+				if set_wg_route(act, conc, clat) == 0 then
 					configured = true
 					break
 				else
